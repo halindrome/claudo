@@ -1,0 +1,34 @@
+{
+  "name": "claudo",
+  "version": "1.0.0",
+  "description": "Run Claude Code against DigitalOcean Gradient AI — spins up a local LiteLLM proxy to bridge Claude Code's Anthropic API format to DO's OpenAI-compatible endpoint.",
+  "license": "MIT",
+  "bin": {
+    "claudo": "./bin/claudo"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "digitalocean",
+    "gradient-ai",
+    "litellm",
+    "ai",
+    "llm",
+    "cli"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/digitalocean/claudo.git"
+  },
+  "bugs": {
+    "url": "https://github.com/digitalocean/claudo/issues"
+  },
+  "homepage": "https://github.com/digitalocean/claudo#readme"
+}

@@ -1,0 +1,3 @@
+# Only ship bin/ and package.json
+.git
+*.log

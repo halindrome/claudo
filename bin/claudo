@@ -1,0 +1,910 @@
+#!/usr/bin/env bash
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  claudo — Claude Code via DigitalOcean Gradient AI                         ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+#
+# WHAT THIS SCRIPT DOES
+# ─────────────────────
+# claudo lets you run Claude Code (Anthropic's CLI tool) against DigitalOcean's
+# Gradient AI inference endpoint instead of Anthropic's own API. It works by
+# spinning up a local LiteLLM proxy server that translates between Claude Code's
+# native Anthropic API format and DO's OpenAI-compatible API format, then
+# launching Claude Code pointed at that local proxy.
+#
+# WHY IT EXISTS
+# ─────────────
+# Claude Code expects to talk to the Anthropic API (api.anthropic.com), but
+# DigitalOcean's Gradient AI service exposes Claude models via an OpenAI-
+# compatible endpoint. LiteLLM bridges this gap by accepting Anthropic-format
+# requests from Claude Code and forwarding them as OpenAI-format requests to DO.
+#
+# ARCHITECTURE
+# ────────────
+#                  ┌────────────┐         ┌────────────┐         ┌────────────┐
+#                  │ Claude Code│  ──▶    │  LiteLLM   │  ──▶    │  DO Grad.  │
+#                  │   (CLI)    │ Anthropic│   Proxy    │ OpenAI  │  AI API    │
+#                  │            │  format  │ (localhost)│ format  │            │
+#                  └────────────┘         └────────────┘         └────────────┘
+#                       ▲                   Port 4100+             inference.
+#                       │                   127.0.0.1             do-ai.run/v1
+#                  ANTHROPIC_BASE_URL
+#                  pointed at proxy
+#
+# WHAT HAPPENS ON EACH RUN
+# ────────────────────────
+#   1. Loads config (DO API key) from ~/.config/claudo/config.env
+#   2. Discovers available Claude models from the DO /v1/models endpoint
+#      (cached for 24h in ~/.config/claudo/models_cache.json)
+#   3. Generates a LiteLLM config YAML that maps Claude Code model names
+#      (e.g. "claude-sonnet-4-5") to DO model IDs (e.g. "anthropic-claude-4.5-sonnet")
+#   4. Finds an available port in the 4100-4200 range
+#   5. Starts a LiteLLM proxy server on that port (backgrounded)
+#   6. Waits for the proxy health check to pass (up to 30s)
+#   7. Sets ANTHROPIC_BASE_URL to point at the local proxy
+#   8. Launches `claude` with all user-provided arguments
+#   9. On exit, cleanly shuts down the proxy (SIGTERM → SIGKILL)
+#
+# MODEL NAME MAPPING
+# ──────────────────
+# DO model IDs look like "anthropic-claude-4.5-sonnet" but Claude Code requests
+# models like "claude-sonnet-4-5" or "claude-4-5-sonnet". The script dynamically
+# generates all plausible name permutations for each DO model and creates
+# fallback aliases so that any model Claude Code might request gets routed to
+# the best available match in that family (sonnet/opus/haiku).
+#
+# PYTHON WRAPPER PATCHES
+# ──────────────────────
+# The script generates a Python wrapper (litellm_wrapper.py) that monkey-patches
+# three known LiteLLM issues before starting the proxy:
+#   - uvicorn's uvloop dependency (broken on Python 3.14+) → forces asyncio
+#   - Anthropic pass-through adapter forwarding unsupported params like
+#     "context_management" → strips them before forwarding to DO
+#   - OpenAI Responses API routing for thinking/extended thinking params →
+#     skipped for DO models (DO doesn't support the Responses API)
+#
+# MULTI-INSTANCE SUPPORT
+# ──────────────────────
+# Multiple claudo sessions can run concurrently. Each gets its own port and
+# PID file in ~/.config/claudo/instances/. Stale PID files from crashed
+# sessions are automatically cleaned up.
+#
+# DEPENDENCIES
+# ────────────
+#   - bash (4.0+)
+#   - python3 (for LiteLLM and config generation)
+#   - node (for Claude Code CLI)
+#   - claude (npm install -g @anthropic-ai/claude-code)
+#   - litellm[proxy] (auto-installed into a venv on first run)
+#   - curl (for API calls and health checks)
+#
+# FILES AND DIRECTORIES
+# ─────────────────────
+#   ~/.config/claudo/
+#   ├── config.env              API key (chmod 600)
+#   ├── models_cache.json       Cached /v1/models response (24h TTL)
+#   ├── litellm_config.yaml     Auto-generated LiteLLM proxy config
+#   ├── litellm_wrapper.py      Python wrapper with monkey-patches
+#   ├── venv/                   Python venv with LiteLLM installed
+#   ├── instances/
+#   │   └── proxy-{port}.pid    PID files for running proxy instances
+#   └── logs/
+#       └── proxy-{port}.log    Stdout/stderr from proxy processes
+#
+# COMMANDS
+# ────────
+#   claudo                      Start interactive Claude session via DO
+#   claudo <claude args>        Pass arguments through to claude CLI
+#   claudo setup                Configure API key, install deps, discover models
+#   claudo status               Show running proxy instances with uptime
+#   claudo stop-all             Kill all running proxy instances
+#   claudo models               Show DO model → Claude Code model name mappings
+#   claudo version              Print version
+#   claudo help                 Print usage help
+#
+# ENVIRONMENT VARIABLES (set automatically for Claude Code)
+# ─────────────────────
+#   ANTHROPIC_BASE_URL          http://127.0.0.1:{port} (local proxy)
+#   ANTHROPIC_AUTH_TOKEN        Proxy master key (for LiteLLM auth)
+#   DO_GRADIENT_API_KEY         User's DigitalOcean Gradient AI API key
+#
+# INSTALLATION
+# ────────────
+#   Place this script in ~/.local/bin/ (which must be in your $PATH):
+#     mkdir -p ~/.local/bin
+#     cp claudo ~/.local/bin/claudo
+#     chmod +x ~/.local/bin/claudo
+#
+# FIRST-TIME SETUP
+# ────────────────
+#   1. Get a DO Gradient AI API key from DigitalOcean
+#   2. Run: claudo setup
+#   3. Paste your API key when prompted
+#   4. Run: claudo
+#
+# ══════════════════════════════════════════════════════════════════════════════
+
+set -euo pipefail
+
+readonly VERSION="1.0.0"
+readonly CONFIG_DIR="${HOME}/.config/claudo"
+readonly CONFIG_FILE="${CONFIG_DIR}/config.env"
+readonly MODELS_CACHE="${CONFIG_DIR}/models_cache.json"
+readonly LITELLM_CONFIG="${CONFIG_DIR}/litellm_config.yaml"
+readonly VENV_DIR="${CONFIG_DIR}/venv"
+readonly LITELLM_WRAPPER="${CONFIG_DIR}/litellm_wrapper.py"
+readonly INSTANCES_DIR="${CONFIG_DIR}/instances"
+readonly LOGS_DIR="${CONFIG_DIR}/logs"
+readonly PORT_MIN=4100
+readonly PORT_MAX=4200
+readonly HEALTH_TIMEOUT=30
+readonly DO_API_BASE="https://inference.do-ai.run"
+readonly PROXY_MASTER_KEY="sk-claudo-$(openssl rand -hex 16)"
+
+# Guard against double-cleanup
+_CLEANUP_DONE=0
+_PROXY_PID=""
+_PROXY_PORT=""
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+die()  { printf '\033[31merror:\033[0m %s\n' "$1" >&2; exit 1; }
+info() { printf '\033[34m▸\033[0m %s\n' "$1"; }
+warn() { printf '\033[33m▸\033[0m %s\n' "$1"; }
+ok()   { printf '\033[32m✓\033[0m %s\n' "$1"; }
+
+ensure_dirs() {
+  mkdir -p "${CONFIG_DIR}" "${INSTANCES_DIR}" "${LOGS_DIR}"
+}
+
+# Write the Python wrapper that patches LiteLLM for DO Gradient AI compatibility
+write_litellm_wrapper() {
+  cat > "${LITELLM_WRAPPER}" <<'PYEOF'
+"""claudo litellm wrapper — patches for DO Gradient AI compatibility."""
+import sys
+
+# Patch uvicorn to use asyncio instead of uvloop (uvloop broken on Python 3.14+)
+try:
+    import uvicorn.config
+    uvicorn.config.LOOP_SETUPS["uvloop"] = "uvicorn.loops.asyncio:asyncio_setup"
+except Exception:
+    pass
+
+# Patch the Anthropic pass-through adapter to exclude params that DO/Anthropic
+# rejects when forwarded via OpenAI format (e.g. context_management in interactive mode).
+# The method lives on LiteLLMMessagesToCompletionTransformationHandler, NOT AnthropicAdapter.
+try:
+    from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
+        LiteLLMMessagesToCompletionTransformationHandler as _Handler,
+    )
+
+    _orig_prepare = _Handler._prepare_completion_kwargs
+
+    def _strip_empty_text_blocks(messages):
+        if not isinstance(messages, list):
+            return messages
+        cleaned = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                cleaned.append(msg)
+                continue
+            content = msg.get("content")
+            if isinstance(content, list):
+                new_content = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = block.get("text")
+                        if text is None or (isinstance(text, str) and text.strip() == ""):
+                            continue
+                    new_content.append(block)
+                if len(new_content) == 0:
+                    # Drop messages that are effectively empty after filtering
+                    continue
+                msg = dict(msg)
+                msg["content"] = new_content
+            elif isinstance(content, str) and content.strip() == "":
+                # Drop empty string-only messages
+                continue
+            cleaned.append(msg)
+        return cleaned
+
+    # All params are keyword-only (after *), so **kwargs captures them correctly
+    def _patched_prepare(**kwargs):
+        extra_kwargs = kwargs.get("extra_kwargs") or {}
+        for drop_key in ("context_management",):
+            extra_kwargs.pop(drop_key, None)
+        kwargs["extra_kwargs"] = extra_kwargs
+        # Remove empty text blocks which Anthropic rejects
+        if "messages" in kwargs:
+            kwargs["messages"] = _strip_empty_text_blocks(kwargs.get("messages"))
+        system = kwargs.get("system")
+        if isinstance(system, list):
+            new_system = []
+            for block in system:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = block.get("text")
+                    if text is None or (isinstance(text, str) and text.strip() == ""):
+                        continue
+                new_system.append(block)
+            kwargs["system"] = new_system if new_system else None
+        elif isinstance(system, str) and system.strip() == "":
+            kwargs["system"] = None
+        return _orig_prepare(**kwargs)
+
+    _Handler._prepare_completion_kwargs = staticmethod(_patched_prepare)
+
+    # Prevent routing to OpenAI Responses API for DO models.
+    # LiteLLM detects openai/ prefix + thinking params and prefixes model with
+    # "responses/" to use OpenAI's Responses API. DO doesn't support this.
+    _orig_route = _Handler._route_openai_thinking_to_responses_api_if_needed
+
+    def _patched_route(completion_kwargs, *, thinking=None):
+        model = completion_kwargs.get("model", "")
+        if isinstance(model, str) and "anthropic" in model:
+            return  # skip responses API routing for DO Anthropic models
+        return _orig_route(completion_kwargs, thinking=thinking)
+
+    _Handler._route_openai_thinking_to_responses_api_if_needed = staticmethod(_patched_route)
+except Exception as e:
+    print(f"[claudo] WARNING: failed to patch adapter: {e}", file=sys.stderr)
+
+from litellm.proxy.proxy_cli import run_server
+run_server()
+PYEOF
+}
+
+# Returns the path to the litellm binary (venv or system)
+resolve_litellm() {
+  if [[ -x "${VENV_DIR}/bin/python" ]] && [[ -f "${LITELLM_WRAPPER}" ]]; then
+    echo "wrapper"
+    return 0
+  elif [[ -x "${VENV_DIR}/bin/litellm" ]]; then
+    echo "${VENV_DIR}/bin/litellm"
+    return 0
+  elif command -v litellm >/dev/null 2>&1; then
+    command -v litellm
+    return 0
+  fi
+  return 1
+}
+
+# ── Config ───────────────────────────────────────────────────────────────────
+
+load_config() {
+  if [[ -f "${CONFIG_FILE}" ]]; then
+    # shellcheck disable=SC1090
+    source "${CONFIG_FILE}"
+  fi
+}
+
+save_config() {
+  printf '# claudo configuration — generated %s\nDO_GRADIENT_API_KEY=%q\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${DO_GRADIENT_API_KEY:-}" > "${CONFIG_FILE}"
+  chmod 600 "${CONFIG_FILE}"
+}
+
+# ── Dependency Checks ────────────────────────────────────────────────────────
+
+check_deps() {
+  local missing=0
+
+  if ! command -v node >/dev/null 2>&1; then
+    warn "Node.js not found. Install via: brew install node  (or https://nodejs.org)"
+    missing=1
+  fi
+
+  if ! command -v claude >/dev/null 2>&1; then
+    warn "Claude Code CLI not found. Install via: npm install -g @anthropic-ai/claude-code"
+    missing=1
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "Python 3 not found. Install via: brew install python3"
+    missing=1
+  fi
+
+  if ! resolve_litellm >/dev/null 2>&1; then
+    info "LiteLLM not found. Installing into venv at ${VENV_DIR}..."
+    python3 -m venv "${VENV_DIR}" || die "Failed to create virtual environment"
+    "${VENV_DIR}/bin/pip" install --quiet 'litellm[proxy]' || die "Failed to install LiteLLM"
+    write_litellm_wrapper
+    ok "LiteLLM installed in ${VENV_DIR}"
+  fi
+
+  if [[ $missing -eq 1 ]]; then
+    die "Missing dependencies. Install them and try again."
+  fi
+}
+
+# ── Claude Code Auth Bootstrap ───────────────────────────────────────────────
+
+bootstrap_claude_auth() {
+  local claude_dir="${HOME}/.claude"
+  local claude_json="${claude_dir}/.claude.json"
+
+  # Check if Claude Code auth is already configured
+  if [[ -f "${claude_json}" ]]; then
+    # Check if already has valid auth or sufficient setup
+    local has_setup
+    has_setup=$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+print('yes' if d.get('numStartups', 0) >= 1 else 'no')
+" "${claude_json}" 2>/dev/null || echo "no")
+    if [[ "${has_setup}" == "yes" ]]; then
+      return 0
+    fi
+  fi
+
+  info "Bootstrapping Claude Code auth for API key usage..."
+  mkdir -p "${claude_dir}"
+
+  if [[ -f "${claude_json}" ]]; then
+    # Update existing config
+    python3 -c "
+import json, sys
+path = sys.argv[1]
+with open(path) as f:
+    d = json.load(f)
+d['numStartups'] = max(d.get('numStartups', 0), 1)
+if 'firstStartTime' not in d:
+    from datetime import datetime, timezone
+    d['firstStartTime'] = datetime.now(timezone.utc).isoformat()
+with open(path, 'w') as f:
+    json.dump(d, f, indent=2)
+" "${claude_json}" 2>/dev/null || warn "Could not update Claude Code config"
+  else
+    # Create minimal config
+    python3 -c "
+import json, sys
+from datetime import datetime, timezone
+d = {
+    'numStartups': 1,
+    'firstStartTime': datetime.now(timezone.utc).isoformat(),
+    'hasCompletedOnboarding': True
+}
+with open(sys.argv[1], 'w') as f:
+    json.dump(d, f, indent=2)
+" "${claude_json}" 2>/dev/null || warn "Could not create Claude Code config"
+    chmod 600 "${claude_json}"
+  fi
+
+  ok "Claude Code configured for API key auth"
+}
+
+# ── Setup ────────────────────────────────────────────────────────────────────
+
+cmd_setup() {
+  ensure_dirs
+  info "claudo setup v${VERSION}"
+  echo ""
+
+  # Ask for API key
+  local current_key=""
+  if [[ -f "${CONFIG_FILE}" ]]; then
+    load_config
+    current_key="${DO_GRADIENT_API_KEY:-}"
+  fi
+
+  if [[ -n "${current_key}" ]]; then
+    local masked="${current_key:0:8}...${current_key: -4}"
+    printf "Current API key: %s\n" "${masked}"
+    printf "Enter new DO Gradient AI API key (or press Enter to keep current): "
+  else
+    printf "Enter your DigitalOcean Gradient AI API key: "
+  fi
+
+  read -r input_key
+  if [[ -n "${input_key}" ]]; then
+    DO_GRADIENT_API_KEY="${input_key}"
+  elif [[ -z "${current_key}" ]]; then
+    die "API key is required"
+  fi
+
+  save_config
+  ok "Config saved to ${CONFIG_FILE}"
+
+  # Check deps
+  check_deps
+
+  # Bootstrap Claude Code auth so the login screen never appears
+  bootstrap_claude_auth
+
+  # Discover models
+  info "Discovering available models..."
+  discover_models force
+  ok "Setup complete! Run 'claudo' to start a Claude session via DO."
+}
+
+# ── Model Discovery ─────────────────────────────────────────────────────────
+
+discover_models() {
+  local force="${1:-}"
+
+  # Check cache freshness (24h TTL)
+  if [[ "${force}" != "force" ]] && [[ -f "${MODELS_CACHE}" ]]; then
+    local cache_age
+    if [[ "$(uname)" == "Darwin" ]]; then
+      local cache_mtime
+      cache_mtime=$(stat -f %m "${MODELS_CACHE}" 2>/dev/null || echo 0)
+      local now
+      now=$(date +%s)
+      cache_age=$(( now - cache_mtime ))
+    else
+      cache_age=$(( $(date +%s) - $(stat -c %Y "${MODELS_CACHE}" 2>/dev/null || echo 0) ))
+    fi
+    if [[ ${cache_age} -lt 86400 ]]; then
+      return 0
+    fi
+  fi
+
+  load_config
+  if [[ -z "${DO_GRADIENT_API_KEY:-}" ]]; then
+    die "No API key configured. Run: claudo setup"
+  fi
+
+  local response
+  response=$(curl -sf --connect-timeout 10 --max-time 30 \
+    "${DO_API_BASE}/v1/models" \
+    -H "Authorization: Bearer ${DO_GRADIENT_API_KEY}" 2>/dev/null) || die "Failed to fetch models from DO API. Check your API key and network."
+
+  echo "${response}" > "${MODELS_CACHE}"
+  generate_litellm_config
+}
+
+generate_litellm_config() {
+  if [[ ! -f "${MODELS_CACHE}" ]]; then
+    die "Models cache not found. Run: claudo setup"
+  fi
+
+  load_config
+
+  # Use Python to dynamically generate the full LiteLLM config from /v1/models response.
+  # This avoids any hardcoded mapping table — model names are derived algorithmically,
+  # and fallback aliases are generated for models Claude Code may request but DO lacks.
+  python3 - "${MODELS_CACHE}" "${DO_API_BASE}/v1" "${PROXY_MASTER_KEY}" <<'PYEOF' > "${LITELLM_CONFIG}" || die "Failed to generate LiteLLM config"
+import json, re, sys
+
+API_BASE = sys.argv[2]
+MASTER_KEY = sys.argv[3]
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+
+do_models = sorted(m["id"] for m in data.get("data", []) if "claude" in m["id"].lower())
+
+if not do_models:
+    print("No Claude models found", file=sys.stderr)
+    sys.exit(1)
+
+def do_to_cc_names(do_id):
+    """Generate all plausible Claude Code model names for a DO model ID.
+    Returns (primary_name, [alias_names]) where primary is the best guess
+    and aliases cover other patterns Claude Code might use."""
+    # Strip 'anthropic-' prefix: 'anthropic-claude-4.5-sonnet' -> 'claude-4.5-sonnet'
+    base = re.sub(r'^anthropic-', '', do_id)
+    # Replace dots with dashes: 'claude-4.5-sonnet' -> 'claude-4-5-sonnet'
+    normalized = base.replace('.', '-')
+
+    names = set()
+    names.add(normalized)
+
+    # Extract family (sonnet/opus/haiku) and version parts
+    # Patterns: claude-{ver}-{family}, claude-{family}-{ver}, claude-{ver}-{family}
+    family_match = re.search(r'(sonnet|opus|haiku)', normalized)
+    version_match = re.findall(r'(\d+(?:-\d+)?)', normalized)
+
+    if family_match and version_match:
+        family = family_match.group(1)
+        # Build version string from all numeric parts
+        ver_parts = '-'.join(version_match)
+
+        # Generate both orderings: claude-{family}-{ver} and claude-{ver}-{family}
+        names.add(f"claude-{family}-{ver_parts}")
+        names.add(f"claude-{ver_parts}-{family}")
+
+    # The primary name is the normalized form
+    primary = normalized
+    aliases = sorted(names - {primary})
+    return primary, aliases
+
+# Collect all entries: (cc_model_name, do_model_id)
+entries = []
+mapped_cc_names = set()
+primary_names = set()  # Names from actual DO models (not fallbacks)
+
+for do_id in do_models:
+    primary, aliases = do_to_cc_names(do_id)
+    entries.append((primary, do_id))
+    mapped_cc_names.add(primary)
+    primary_names.add(primary)
+    for alias in aliases:
+        if alias not in mapped_cc_names:
+            entries.append((alias, do_id))
+            mapped_cc_names.add(alias)
+            primary_names.add(alias)
+
+# Fallback aliases: if Claude Code requests a model we don't have,
+# route it to the best available model in the same family.
+# Gather best model per family (highest version number).
+family_best = {}  # family -> (version_tuple, do_model_id)
+for do_id in do_models:
+    base = re.sub(r'^anthropic-', '', do_id)
+    for family in ('sonnet', 'opus', 'haiku'):
+        if family in base:
+            nums = [int(x) for x in re.findall(r'(\d+)', base)]
+            ver_tuple = tuple(nums) if nums else (0,)
+            if family not in family_best or ver_tuple > family_best[family][0]:
+                family_best[family] = (ver_tuple, do_id)
+            break
+
+# Known Claude Code model names that may not have exact DO matches.
+# Generate common patterns: claude-{family}-{major}-{minor}
+for family, (ver_tuple, best_do) in family_best.items():
+    # Generate unversioned catchall: claude-{family} (not typically used, but safe)
+    # More importantly: generate versioned names Claude Code might request
+    # e.g., claude-sonnet-4-6, claude-haiku-4-6, claude-opus-4-6
+    # We check if they're already mapped; if not, add as fallback to best available.
+    for major in range(3, 6):
+        for minor in range(0, 10):
+            candidate = f"claude-{family}-{major}-{minor}"
+            if candidate not in mapped_cc_names:
+                entries.append((candidate, best_do))
+                mapped_cc_names.add(candidate)
+
+# Add date-suffixed entries for primary model names.
+# Claude Code requests models like "claude-haiku-4-5-20251001" (with date suffix)
+# but DO model IDs don't include dates. Add entries for all known Anthropic release
+# dates so dated model names route to the correct DO model.
+KNOWN_DATES = ["20240229", "20241022", "20250219", "20250514", "20250929", "20251001"]
+for base_name in list(primary_names):
+    # Find the DO model ID for this base name
+    do_id_for_base = None
+    for cc_name, do_id in entries:
+        if cc_name == base_name:
+            do_id_for_base = do_id
+            break
+    if do_id_for_base is None:
+        continue
+    for date in KNOWN_DATES:
+        dated = f"{base_name}-{date}"
+        if dated not in mapped_cc_names:
+            entries.append((dated, do_id_for_base))
+            mapped_cc_names.add(dated)
+
+# Write YAML
+lines = ["# Auto-generated by claudo — do not edit manually", "model_list:"]
+seen = set()
+for cc_name, do_id in entries:
+    if cc_name in seen:
+        continue
+    seen.add(cc_name)
+    lines.append(f"  - model_name: {cc_name}")
+    lines.append(f"    litellm_params:")
+    lines.append(f"      model: openai/{do_id}")
+    lines.append(f"      api_key: os.environ/DO_GRADIENT_API_KEY")
+    lines.append(f"      api_base: {API_BASE}")
+    lines.append(f"      drop_params: true")
+    lines.append(f"      request_timeout: 600")
+
+lines.append("")
+lines.append("general_settings:")
+lines.append("  drop_params: true")
+lines.append(f"  master_key: {MASTER_KEY}")
+lines.append("")
+lines.append("litellm_settings:")
+lines.append("  drop_params: true")
+lines.append("  request_timeout: 600")
+
+print("\n".join(lines))
+count = len(seen)
+print(f"Generated {count} model entries", file=sys.stderr)
+PYEOF
+
+  ok "Generated LiteLLM config from /v1/models"
+}
+
+# ── Port Management ──────────────────────────────────────────────────────────
+
+cleanup_stale_pids() {
+  local pidfile
+  for pidfile in "${INSTANCES_DIR}"/proxy-*.pid; do
+    [[ -f "${pidfile}" ]] || continue
+    local content
+    content=$(cat "${pidfile}" 2>/dev/null) || continue
+    local pid
+    pid=$(echo "${content}" | cut -d: -f1)
+    if [[ -n "${pid}" ]] && ! kill -0 "${pid}" 2>/dev/null; then
+      rm -f "${pidfile}"
+    fi
+  done
+}
+
+find_available_port() {
+  cleanup_stale_pids
+  local port=${PORT_MIN}
+  while [[ ${port} -le ${PORT_MAX} ]]; do
+    if ! lsof -i "TCP:${port}" -sTCP:LISTEN >/dev/null 2>&1; then
+      # Also check no PID file claims this port
+      if [[ ! -f "${INSTANCES_DIR}/proxy-${port}.pid" ]]; then
+        echo "${port}"
+        return 0
+      fi
+    fi
+    port=$((port + 1))
+  done
+  die "No available ports in range ${PORT_MIN}-${PORT_MAX}. Run: claudo stop-all"
+}
+
+# ── Proxy Lifecycle ──────────────────────────────────────────────────────────
+
+start_proxy() {
+  local port="$1"
+  local log_file="${LOGS_DIR}/proxy-${port}.log"
+
+  local litellm_mode
+  litellm_mode=$(resolve_litellm) || die "LiteLLM not found. Run: claudo setup"
+
+  if [[ "${litellm_mode}" == "wrapper" ]]; then
+    DO_GRADIENT_API_KEY="${DO_GRADIENT_API_KEY}" "${VENV_DIR}/bin/python" \
+      "${LITELLM_WRAPPER}" \
+      --config "${LITELLM_CONFIG}" \
+      --host 127.0.0.1 \
+      --port "${port}" \
+      > "${log_file}" 2>&1 &
+  else
+    DO_GRADIENT_API_KEY="${DO_GRADIENT_API_KEY}" "${litellm_mode}" \
+      --config "${LITELLM_CONFIG}" \
+      --host 127.0.0.1 \
+      --port "${port}" \
+      > "${log_file}" 2>&1 &
+  fi
+
+  _PROXY_PID=$!
+  _PROXY_PORT="${port}"
+
+  # Write PID file: pid:port:parent_pid:timestamp
+  echo "${_PROXY_PID}:${port}:$$:$(date +%s)" > "${INSTANCES_DIR}/proxy-${port}.pid"
+}
+
+wait_for_proxy() {
+  local port="$1"
+  local elapsed=0
+  local url="http://127.0.0.1:${port}/health/readiness"
+
+  info "Waiting for LiteLLM proxy on port ${port}..."
+  while [[ ${elapsed} -lt ${HEALTH_TIMEOUT} ]]; do
+    if curl -sf "${url}" >/dev/null 2>&1; then
+      ok "Proxy ready on port ${port}"
+      return 0
+    fi
+    # Check proxy hasn't died
+    if [[ -n "${_PROXY_PID}" ]] && ! kill -0 "${_PROXY_PID}" 2>/dev/null; then
+      echo ""
+      warn "Proxy exited unexpectedly. Log output:"
+      tail -20 "${LOGS_DIR}/proxy-${port}.log" 2>/dev/null || true
+      die "LiteLLM proxy failed to start"
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  die "Proxy health check timed out after ${HEALTH_TIMEOUT}s"
+}
+
+cleanup() {
+  if [[ ${_CLEANUP_DONE} -eq 1 ]]; then
+    return
+  fi
+  _CLEANUP_DONE=1
+
+  if [[ -n "${_PROXY_PID}" ]]; then
+    # SIGTERM first
+    kill "${_PROXY_PID}" 2>/dev/null || true
+    # Wait up to 3s for clean exit
+    local waited=0
+    while [[ ${waited} -lt 3 ]] && kill -0 "${_PROXY_PID}" 2>/dev/null; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    # SIGKILL if still alive
+    if kill -0 "${_PROXY_PID}" 2>/dev/null; then
+      kill -9 "${_PROXY_PID}" 2>/dev/null || true
+    fi
+  fi
+
+  if [[ -n "${_PROXY_PORT}" ]]; then
+    rm -f "${INSTANCES_DIR}/proxy-${_PROXY_PORT}.pid"
+  fi
+}
+
+# ── Subcommands ──────────────────────────────────────────────────────────────
+
+cmd_status() {
+  ensure_dirs
+  cleanup_stale_pids
+  local found=0
+  local pidfile
+  for pidfile in "${INSTANCES_DIR}"/proxy-*.pid; do
+    [[ -f "${pidfile}" ]] || continue
+    local content
+    content=$(cat "${pidfile}" 2>/dev/null) || continue
+    local pid port parent_pid start_ts
+    pid=$(echo "${content}" | cut -d: -f1)
+    port=$(echo "${content}" | cut -d: -f2)
+    parent_pid=$(echo "${content}" | cut -d: -f3)
+    start_ts=$(echo "${content}" | cut -d: -f4)
+
+    local uptime_str="unknown"
+    if [[ -n "${start_ts}" ]]; then
+      local now
+      now=$(date +%s)
+      local elapsed=$(( now - start_ts ))
+      local mins=$(( elapsed / 60 ))
+      local secs=$(( elapsed % 60 ))
+      uptime_str="${mins}m${secs}s"
+    fi
+
+    printf "  PID %-8s  Port %-6s  Parent %-8s  Uptime %s\n" "${pid}" "${port}" "${parent_pid}" "${uptime_str}"
+    found=$((found + 1))
+  done
+
+  if [[ ${found} -eq 0 ]]; then
+    info "No running claudo instances"
+  else
+    info "${found} instance(s) running"
+  fi
+}
+
+cmd_stop_all() {
+  ensure_dirs
+  local stopped=0
+  local pidfile
+  for pidfile in "${INSTANCES_DIR}"/proxy-*.pid; do
+    [[ -f "${pidfile}" ]] || continue
+    local content
+    content=$(cat "${pidfile}" 2>/dev/null) || continue
+    local pid
+    pid=$(echo "${content}" | cut -d: -f1)
+    if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+      kill "${pid}" 2>/dev/null || true
+      stopped=$((stopped + 1))
+    fi
+    rm -f "${pidfile}"
+  done
+
+  if [[ ${stopped} -eq 0 ]]; then
+    info "No running instances to stop"
+  else
+    ok "Stopped ${stopped} instance(s)"
+  fi
+}
+
+cmd_models() {
+  ensure_dirs
+  load_config
+
+  if [[ ! -f "${MODELS_CACHE}" ]]; then
+    info "No cached models. Running discovery..."
+    discover_models force
+  fi
+
+  # Use Python to display model mappings (same logic as config generation)
+  python3 - "${MODELS_CACHE}" <<'PYEOF' || die "Failed to parse models cache"
+import json, re, sys
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+
+do_models = sorted(m["id"] for m in data.get("data", []) if "claude" in m["id"].lower())
+
+def primary_cc_name(do_id):
+    base = re.sub(r'^anthropic-', '', do_id)
+    return base.replace('.', '-')
+
+print()
+print(f"{'DO Gradient Model':<40}  →  {'Claude Code Model'}")
+print(f"{'─' * 40}     {'─' * 34}")
+for do_id in do_models:
+    cc = primary_cc_name(do_id)
+    print(f"{do_id:<40}  →  {cc}")
+PYEOF
+
+  echo ""
+  local cache_time="unknown"
+  if [[ -f "${MODELS_CACHE}" ]]; then
+    if [[ "$(uname)" == "Darwin" ]]; then
+      cache_time=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M" "${MODELS_CACHE}" 2>/dev/null || echo "unknown")
+    else
+      cache_time=$(stat -c "%y" "${MODELS_CACHE}" 2>/dev/null | cut -d. -f1 || echo "unknown")
+    fi
+  fi
+  info "Cache last updated: ${cache_time}"
+  info "Run 'claudo setup' to refresh"
+}
+
+cmd_version() {
+  echo "claudo v${VERSION}"
+}
+
+cmd_help() {
+  cat <<EOF
+claudo v${VERSION} — Claude Code via DigitalOcean Gradient AI
+
+Usage:
+  claudo                    Start interactive Claude session via DO
+  claudo <claude args>      Pass arguments to claude (e.g. claudo -p "hello")
+  claudo setup              Configure API key and discover models
+  claudo status             Show running proxy instances
+  claudo stop-all           Kill all proxy instances
+  claudo models             Show discovered model mappings
+  claudo version            Show version
+  claudo help               Show this help
+
+Examples:
+  claudo setup              First-time setup
+  claudo                    Interactive session
+  claudo -p "explain this"  One-shot prompt
+  claudo --model claude-sonnet-4-5-20250929 -p "hello"
+EOF
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+main() {
+  ensure_dirs
+
+  # Handle subcommands
+  case "${1:-}" in
+    setup)     cmd_setup; return ;;
+    status)    cmd_status; return ;;
+    stop-all)  cmd_stop_all; return ;;
+    models)    cmd_models; return ;;
+    version)   cmd_version; return ;;
+    help|--help|-h)  cmd_help; return ;;
+  esac
+
+  # Main flow: start proxy and launch claude
+  load_config
+
+  if [[ -z "${DO_GRADIENT_API_KEY:-}" ]]; then
+    info "First-time setup required"
+    cmd_setup
+    # Re-load after setup
+    load_config
+  fi
+
+  check_deps
+
+  # Discover/refresh models
+  discover_models
+
+  # Regenerate LiteLLM config each session (embeds per-session master key)
+  generate_litellm_config
+
+  # Always regenerate wrapper to ensure patches are up-to-date
+  if [[ -x "${VENV_DIR}/bin/python" ]]; then
+    write_litellm_wrapper
+  fi
+
+  # Find an available port
+  local port
+  port=$(find_available_port)
+
+  # Register cleanup trap
+  trap cleanup EXIT INT TERM HUP
+
+  # Start proxy
+  start_proxy "${port}"
+  wait_for_proxy "${port}"
+
+  # Launch Claude Code pointed at our proxy
+  info "Launching Claude Code via DO Gradient AI (port ${port})..."
+  export ANTHROPIC_BASE_URL="http://127.0.0.1:${port}"
+  export ANTHROPIC_AUTH_TOKEN="${PROXY_MASTER_KEY}"
+  export DO_GRADIENT_API_KEY
+
+  # Pass all arguments through to claude, or run interactively
+  claude "$@"
+}
+
+main "$@"
