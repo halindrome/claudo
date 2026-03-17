@@ -684,6 +684,15 @@ main() {
   export ANTHROPIC_AUTH_TOKEN="${PROXY_MASTER_KEY}"
   export DO_GRADIENT_API_KEY
 
+  # Model pinning: inject DEFAULT_MODEL if user didn't provide --model
+  local _has_model=0
+  for _arg in "$@"; do
+    [[ "$_arg" == "--model" ]] && { _has_model=1; break; }
+  done
+  if [[ ${_has_model} -eq 0 ]] && [[ -n "${DEFAULT_MODEL:-}" ]]; then
+    set -- --model "${DEFAULT_MODEL}" "$@"
+  fi
+
   # Pass all arguments through to claude, or run interactively
   claude "$@"
 }
