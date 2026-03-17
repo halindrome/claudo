@@ -10,6 +10,7 @@ via a conftest-style fixture at the top of this file.
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import types
@@ -94,6 +95,17 @@ BASIC_CASES = [
         "claude-4-0-0-sonnet",
         None,  # just check primary has no dots
     ),
+    # Claude 4.6 models — dot in version, family suffix
+    (
+        "anthropic-claude-4.6-sonnet",
+        "claude-4-6-sonnet",
+        "claude-sonnet-4-6",
+    ),
+    (
+        "anthropic-claude-4.6-opus",
+        "claude-4-6-opus",
+        "claude-opus-4-6",
+    ),
 ]
 
 
@@ -160,3 +172,52 @@ def test_invariant_return_types(do_id):
     primary, aliases = do_to_cc_names(do_id)
     assert isinstance(primary, str)
     assert isinstance(aliases, list)
+
+
+# ---------------------------------------------------------------------------
+# [1m] suffix — KNOWN_SIZES integration test
+# ---------------------------------------------------------------------------
+
+CONFIG_GEN_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "src", "python", "config_gen.py"
+)
+
+
+def _run_config_gen(models):
+    """Run config_gen.py via subprocess with a temporary models cache JSON.
+
+    Returns the stdout YAML string.
+    """
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False
+    )
+    json.dump({"data": [{"id": m} for m in models]}, tmp)
+    tmp.flush()
+    tmp.close()
+
+    try:
+        result = subprocess.run(
+            [sys.executable, CONFIG_GEN_PATH, tmp.name, "http://localhost:4000", "sk-test"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout
+    finally:
+        os.unlink(tmp.name)
+
+
+def test_known_sizes_1m_suffix_in_output():
+    """generate_litellm_config produces entries for claude-opus-4-6[1m] when
+    an opus model is present in the models cache."""
+    yaml_out = _run_config_gen(["anthropic-claude-4.6-opus"])
+    assert "claude-opus-4-6[1m]" in yaml_out, (
+        f"Expected 'claude-opus-4-6[1m]' in output but it was absent.\n"
+        f"Output snippet:\n{yaml_out[:2000]}"
+    )
+
+
+def test_known_sizes_base_model_also_present():
+    """The base model name (without [1m]) is also present in the output."""
+    yaml_out = _run_config_gen(["anthropic-claude-4.6-opus"])
+    assert "claude-opus-4-6" in yaml_out
