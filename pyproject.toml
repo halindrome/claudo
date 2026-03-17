@@ -1,0 +1,10 @@
+# Dev dependencies (install manually):
+#   pip install pytest>=7.0 pytest-mock pytest-cov
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src/python"]
+addopts = "-v"
+
+[tool.coverage.run]
+source = ["src/python"]
