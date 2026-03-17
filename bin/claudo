@@ -35,7 +35,7 @@
 #
 # WHAT HAPPENS ON EACH RUN
 # ────────────────────────
-#   1. Loads config (DO API key) from ~/.config/claudo/config.env
+#   1. Loads config (DO API key) from ~/.config/claudo/config.${CLAUDO_PROFILE}.env
 #   2. Discovers available Claude models from the DO /v1/models endpoint
 #      (cached for 24h in ~/.config/claudo/models_cache.json)
 #   3. Generates a LiteLLM config YAML that maps Claude Code model names
@@ -131,7 +131,8 @@ set -euo pipefail
 
 readonly VERSION="1.0.0"
 readonly CONFIG_DIR="${HOME}/.config/claudo"
-readonly CONFIG_FILE="${CONFIG_DIR}/config.env"
+CLAUDO_PROFILE="${CLAUDO_PROFILE:-default}"
+CONFIG_FILE="${CONFIG_DIR}/config.${CLAUDO_PROFILE}.env"
 readonly MODELS_CACHE="${CONFIG_DIR}/models_cache.json"
 readonly LITELLM_CONFIG="${CONFIG_DIR}/litellm_config.yaml"
 readonly VENV_DIR="${CONFIG_DIR}/venv"
@@ -345,6 +346,10 @@ resolve_litellm() {
 # ── Config ───────────────────────────────────────────────────────────────────
 
 load_config() {
+  # Migrate legacy config.env to config.default.env on first profile-aware run
+  if [[ ! -f "${CONFIG_FILE}" ]] && [[ -f "${CONFIG_DIR}/config.env" ]]; then
+    cp "${CONFIG_DIR}/config.env" "${CONFIG_FILE}"
+  fi
   if [[ -f "${CONFIG_FILE}" ]]; then
     # shellcheck disable=SC1090
     source "${CONFIG_FILE}"
@@ -935,6 +940,26 @@ cmd_update() {
   ok "LiteLLM updated to v${version}"
 }
 
+cmd_profiles() {
+  ensure_dirs
+  local profile_file active_profiles=()
+  for profile_file in "${CONFIG_DIR}"/config.*.env; do
+    [[ -f "$profile_file" ]] || continue
+    local name
+    name="${profile_file##*/config.}"
+    name="${name%.env}"
+    if [[ "$name" == "$CLAUDO_PROFILE" ]]; then
+      echo "* ${name} (active)"
+    else
+      echo "  ${name}"
+    fi
+    active_profiles+=("$name")
+  done
+  if [[ ${#active_profiles[@]} -eq 0 ]]; then
+    info "No profiles found. Run 'claudo setup' to create one."
+  fi
+}
+
 cmd_help() {
   cat <<EOF
 claudo v${VERSION} — Claude Code via DigitalOcean Gradient AI
@@ -947,14 +972,19 @@ Usage:
   claudo status             Show running proxy instances
   claudo stop-all           Kill all proxy instances
   claudo models             Show discovered model mappings
+  claudo profiles           List available profiles
   claudo version            Show version
   claudo help               Show this help
+
+Options:
+  --profile, -P NAME        Select named profile (default: "default")
 
 Examples:
   claudo setup              First-time setup
   claudo                    Interactive session
   claudo -p "explain this"  One-shot prompt
   claudo --model claude-sonnet-4-5-20250929 -p "hello"
+  claudo --profile work     Use the "work" profile (loads config.work.env)
 EOF
 }
 
@@ -963,6 +993,19 @@ EOF
 main() {
   ensure_dirs
 
+  # Early --profile scan (must precede load_config and subcommand dispatch)
+  local _i=1
+  while [[ $_i -le $# ]]; do
+    case "${!_i}" in
+      --profile|-P)
+        _i=$((_i + 1))
+        CLAUDO_PROFILE="${!_i}"
+        CONFIG_FILE="${CONFIG_DIR}/config.${CLAUDO_PROFILE}.env"
+        ;;
+    esac
+    _i=$((_i + 1))
+  done
+
   # Handle subcommands
   case "${1:-}" in
     setup)     cmd_setup; return ;;
@@ -970,6 +1013,7 @@ main() {
     status)    cmd_status; return ;;
     stop-all)  cmd_stop_all; return ;;
     models)    cmd_models; return ;;
+    profiles)  cmd_profiles; return ;;
     version)   cmd_version; return ;;
     help|--help|-h)  cmd_help; return ;;
   esac
@@ -1014,6 +1058,16 @@ main() {
   export ANTHROPIC_BASE_URL="http://127.0.0.1:${port}"
   export ANTHROPIC_AUTH_TOKEN="${PROXY_MASTER_KEY}"
   export DO_GRADIENT_API_KEY
+
+  # Strip --profile/-P and its value from args before passing to claude
+  local _args=()
+  local _skip=0
+  for _arg in "$@"; do
+    if [[ $_skip -eq 1 ]]; then _skip=0; continue; fi
+    if [[ "$_arg" == "--profile" || "$_arg" == "-P" ]]; then _skip=1; continue; fi
+    _args+=("$_arg")
+  done
+  set -- "${_args[@]+"${_args[@]}"}"
 
   # Model pinning: inject DEFAULT_MODEL if user didn't provide --model
   local _has_model=0
