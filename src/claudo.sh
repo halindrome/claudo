@@ -390,6 +390,22 @@ find_available_port() {
   die "No available ports in range ${PORT_MIN}-${PORT_MAX}. Run: claudo stop-all"
 }
 
+rotate_log_if_needed() {
+  local log_file="$1"
+  local max_kb=$(( ${LOG_ROTATION_SIZE_MB:-10} * 1024 ))
+  [[ -f "$log_file" ]] || return 0
+  # Cross-platform size check using find (avoids stat BSD/GNU mismatch)
+  if [[ -z "$(find "$log_file" -size +"${max_kb}k" 2>/dev/null)" ]]; then
+    return 0
+  fi
+  # Rotate: shift existing backups .4.gz→.5.gz ... .1.gz→.2.gz
+  local i
+  for i in 4 3 2 1; do
+    [[ -f "${log_file}.${i}.gz" ]] && mv "${log_file}.${i}.gz" "${log_file}.$((i+1)).gz"
+  done
+  gzip -9 < "$log_file" > "${log_file}.1.gz" && : > "$log_file"
+}
+
 # ── Proxy Lifecycle ──────────────────────────────────────────────────────────
 
 start_proxy() {
