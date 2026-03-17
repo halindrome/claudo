@@ -1,0 +1,85 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/cmm-session-start.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/session-gate.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/agent-cmm-gate.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__codebase-memory-mcp__index_repository|mcp__codebase-memory-mcp__index_status",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/cmm-sentinel-writer.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__context-mode__ctx_execute|mcp__context-mode__ctx_stats|mcp__context-mode__ctx_index|mcp__context-mode__ctx_fetch_and_index|mcp__context-mode__ctx_batch_execute|mcp__context-mode__ctx_execute_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/context-mode-sentinel-writer.sh",
+            "_comment": "optional: writes Context Mode sentinel to unblock session-gate.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__codebase-memory-mcp__*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/track-cmm-calls.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/context-mode-event-logger.sh",
+            "_comment": "optional: Context Mode MCP event logger (no-ops if Context Mode not installed)"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/context-mode-pre-compact.sh",
+            "_comment": "optional: Context Mode MCP pre-compaction snapshot (no-ops if not installed)"
+          }
+        ]
+      }
+    ]
+  }
+}

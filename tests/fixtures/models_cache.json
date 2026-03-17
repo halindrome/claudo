@@ -1,0 +1,7 @@
+{
+  "data": [
+    {"id": "anthropic-claude-4.5-sonnet", "object": "model"},
+    {"id": "anthropic-claude-3-haiku", "object": "model"}
+  ],
+  "object": "list"
+}

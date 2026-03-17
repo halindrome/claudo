@@ -3,8 +3,8 @@
 # ║  claudo — Claude Code via DigitalOcean Gradient AI                         ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 #
-# GENERATED FILE — do not edit directly.
-# Edit src/claudo.sh and src/python/*.py, then run 'make build' to regenerate.
+# TEMPLATE FILE — edit this file and run 'make build' to regenerate bin/claudo.
+# Do NOT edit bin/claudo directly; it is assembled from src/ by scripts/build.sh.
 #
 # WHAT THIS SCRIPT DOES
 # ─────────────────────
@@ -165,166 +165,14 @@ ensure_dirs() {
 # Write the Python wrapper that patches LiteLLM for DO Gradient AI compatibility
 write_litellm_wrapper() {
   cat > "${LITELLM_WRAPPER}" <<'PYEOF'
-"""claudo litellm wrapper — patches for DO Gradient AI compatibility."""
-import sys
-import litellm
-
-# Route /v1/messages through chat/completions instead of the OpenAI Responses API.
-# DO Gradient AI exposes an OpenAI-compatible endpoint (openai/ model prefix) but does
-# NOT implement the Responses API. Without this flag, LiteLLM detects openai/ prefix
-# and tries to call litellm.aresponses(), which DO returns 404 on.
-litellm.use_chat_completions_url_for_anthropic_messages = True
-assert getattr(litellm, 'use_chat_completions_url_for_anthropic_messages', None) is True, \
-    "[claudo] FATAL: litellm.use_chat_completions_url_for_anthropic_messages flag missing — " \
-    "LiteLLM API changed. Update wrapper.py."
-
-# Patch uvicorn to use asyncio instead of uvloop (uvloop broken on Python 3.14+)
-try:
-    import uvicorn.config
-    if not hasattr(uvicorn.config, 'LOOP_SETUPS'):
-        print("[claudo] WARNING: uvicorn.config.LOOP_SETUPS not found — "
-              "uvloop patch skipped. Proxy may fail on Python 3.14+ if uvloop is installed.",
-              file=sys.stderr)
-    else:
-        uvicorn.config.LOOP_SETUPS["uvloop"] = "uvicorn.loops.asyncio:asyncio_setup"
-except ImportError:
-    pass  # uvicorn not installed yet — LiteLLM will install it; patch applied at proxy start
-except Exception as e:
-    print(f"[claudo] WARNING: uvloop patch failed: {e}", file=sys.stderr)
-
-# Patch the Anthropic pass-through adapter to exclude params that DO/Anthropic
-# rejects when forwarded via OpenAI format (e.g. context_management in interactive mode).
-# The method lives on LiteLLMMessagesToCompletionTransformationHandler, NOT AnthropicAdapter.
-try:
-    from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
-        LiteLLMMessagesToCompletionTransformationHandler as _Handler,
-    )
-
-    if not hasattr(_Handler, '_prepare_completion_kwargs'):
-        print(
-            "[claudo] WARNING: LiteLLMMessagesToCompletionTransformationHandler"
-            "._prepare_completion_kwargs not found — adapter patch skipped. "
-            "context_management and empty text blocks will NOT be stripped. "
-            "Update wrapper.py to match current LiteLLM internals.",
-            file=sys.stderr,
-        )
-    else:
-        _orig_prepare = _Handler._prepare_completion_kwargs
-
-        def _strip_empty_text_blocks(messages):
-            if not isinstance(messages, list):
-                return messages
-            cleaned = []
-            for msg in messages:
-                if not isinstance(msg, dict):
-                    cleaned.append(msg)
-                    continue
-                content = msg.get("content")
-                if isinstance(content, list):
-                    new_content = []
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            text = block.get("text")
-                            if text is None or (isinstance(text, str) and text.strip() == ""):
-                                continue
-                        new_content.append(block)
-                    if len(new_content) == 0:
-                        # Drop messages that are effectively empty after filtering
-                        continue
-                    msg = dict(msg)
-                    msg["content"] = new_content
-                elif isinstance(content, str) and content.strip() == "":
-                    # Drop empty string-only messages
-                    continue
-                cleaned.append(msg)
-            return cleaned
-
-        # All params are keyword-only (after *), so **kwargs captures them correctly
-        def _patched_prepare(**kwargs):
-            extra_kwargs = kwargs.get("extra_kwargs") or {}
-            for drop_key in ("context_management",):
-                extra_kwargs.pop(drop_key, None)
-            kwargs["extra_kwargs"] = extra_kwargs
-            # Remove empty text blocks which Anthropic rejects
-            if "messages" in kwargs:
-                kwargs["messages"] = _strip_empty_text_blocks(kwargs.get("messages"))
-            system = kwargs.get("system")
-            if isinstance(system, list):
-                new_system = []
-                for block in system:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text = block.get("text")
-                        if text is None or (isinstance(text, str) and text.strip() == ""):
-                            continue
-                    new_system.append(block)
-                kwargs["system"] = new_system if new_system else None
-            elif isinstance(system, str) and system.strip() == "":
-                kwargs["system"] = None
-            return _orig_prepare(**kwargs)
-
-        _Handler._prepare_completion_kwargs = staticmethod(_patched_prepare)
-except ImportError as e:
-    print(
-        f"[claudo] WARNING: failed to import LiteLLM adapter handler: {e}\n"
-        "  The experimental_pass_through adapter path has moved or been removed.\n"
-        "  context_management params will NOT be stripped — Claude Code may get API errors.\n"
-        "  Update the import path in src/python/wrapper.py.",
-        file=sys.stderr,
-    )
-except Exception as e:
-    print(f"[claudo] WARNING: failed to patch adapter: {e}", file=sys.stderr)
-
-from litellm.proxy.proxy_cli import run_server
-run_server()
+@@EMBED: src/python/wrapper.py@@
 PYEOF
 }
 
 # Write the auth bootstrap helper script
 write_auth_script() {
   cat > "${AUTH_SCRIPT}" <<'PYEOF'
-"""
-Bootstrap and check Claude Code auth configuration.
-
-Usage:
-  python3 auth.py check  <path>   — print 'yes' if already configured, 'no' otherwise
-  python3 auth.py update <path>   — update existing .claude.json to mark as configured
-  python3 auth.py create <path>   — create minimal .claude.json for API key auth
-"""
-import json, sys
-from datetime import datetime, timezone
-
-cmd = sys.argv[1]
-path = sys.argv[2]
-
-if cmd == "check":
-    try:
-        with open(path) as f:
-            d = json.load(f)
-        print("yes" if d.get("numStartups", 0) >= 1 else "no")
-    except Exception:
-        print("no")
-
-elif cmd == "update":
-    with open(path) as f:
-        d = json.load(f)
-    d["numStartups"] = max(d.get("numStartups", 0), 1)
-    if "firstStartTime" not in d:
-        d["firstStartTime"] = datetime.now(timezone.utc).isoformat()
-    with open(path, "w") as f:
-        json.dump(d, f, indent=2)
-
-elif cmd == "create":
-    d = {
-        "numStartups": 1,
-        "firstStartTime": datetime.now(timezone.utc).isoformat(),
-        "hasCompletedOnboarding": True,
-    }
-    with open(path, "w") as f:
-        json.dump(d, f, indent=2)
-
-else:
-    print(f"Unknown command: {cmd}", file=sys.stderr)
-    sys.exit(1)
+@@EMBED: src/python/auth.py@@
 PYEOF
 }
 
@@ -513,165 +361,7 @@ generate_litellm_config() {
   # This avoids any hardcoded mapping table — model names are derived algorithmically,
   # and fallback aliases are generated for models Claude Code may request but DO lacks.
   python3 - "${MODELS_CACHE}" "${DO_API_BASE}/v1" "${PROXY_MASTER_KEY}" <<'PYEOF' > "${LITELLM_CONFIG}" || die "Failed to generate LiteLLM config"
-"""
-Generate a LiteLLM proxy config YAML from a DO /v1/models response cache.
-
-Usage: python3 config_gen.py <models_cache.json> <api_base> <master_key>
-
-Reads the cached model list, generates all plausible Claude Code model name
-aliases for each DO model, and writes a LiteLLM model_list YAML to stdout.
-"""
-import json, re, sys
-
-API_BASE = sys.argv[2]
-MASTER_KEY = sys.argv[3]
-
-with open(sys.argv[1]) as f:
-    data = json.load(f)
-
-do_models = sorted(m["id"] for m in data.get("data", []) if "claude" in m["id"].lower())
-
-if not do_models:
-    print("No Claude models found", file=sys.stderr)
-    sys.exit(1)
-
-def do_to_cc_names(do_id):
-    """Generate all plausible Claude Code model names for a DO model ID.
-    Returns (primary_name, [alias_names]) where primary is the best guess
-    and aliases cover other patterns Claude Code might use."""
-    # Strip 'anthropic-' prefix: 'anthropic-claude-4.5-sonnet' -> 'claude-4.5-sonnet'
-    base = re.sub(r'^anthropic-', '', do_id)
-    # Replace dots with dashes: 'claude-4.5-sonnet' -> 'claude-4-5-sonnet'
-    normalized = base.replace('.', '-')
-
-    names = set()
-    names.add(normalized)
-
-    # Extract family (sonnet/opus/haiku) and version parts
-    # Patterns: claude-{ver}-{family}, claude-{family}-{ver}, claude-{ver}-{family}
-    family_match = re.search(r'(sonnet|opus|haiku)', normalized)
-    version_match = re.findall(r'(\d+(?:-\d+)?)', normalized)
-
-    if family_match and version_match:
-        family = family_match.group(1)
-        # Build version string from all numeric parts
-        ver_parts = '-'.join(version_match)
-
-        # Generate both orderings: claude-{family}-{ver} and claude-{ver}-{family}
-        names.add(f"claude-{family}-{ver_parts}")
-        names.add(f"claude-{ver_parts}-{family}")
-
-    # The primary name is the normalized form
-    primary = normalized
-    aliases = sorted(names - {primary})
-    return primary, aliases
-
-# Collect all entries: (cc_model_name, do_model_id)
-entries = []
-mapped_cc_names = set()
-primary_names = set()  # Names from actual DO models (not fallbacks)
-
-for do_id in do_models:
-    primary, aliases = do_to_cc_names(do_id)
-    entries.append((primary, do_id))
-    mapped_cc_names.add(primary)
-    primary_names.add(primary)
-    for alias in aliases:
-        if alias not in mapped_cc_names:
-            entries.append((alias, do_id))
-            mapped_cc_names.add(alias)
-            primary_names.add(alias)
-
-# Fallback aliases: if Claude Code requests a model we don't have,
-# route it to the best available model in the same family.
-# Gather best model per family (highest version number).
-family_best = {}  # family -> (version_tuple, do_model_id)
-for do_id in do_models:
-    base = re.sub(r'^anthropic-', '', do_id)
-    for family in ('sonnet', 'opus', 'haiku'):
-        if family in base:
-            nums = [int(x) for x in re.findall(r'(\d+)', base)]
-            ver_tuple = tuple(nums) if nums else (0,)
-            if family not in family_best or ver_tuple > family_best[family][0]:
-                family_best[family] = (ver_tuple, do_id)
-            break
-
-# Known Claude Code model names that may not have exact DO matches.
-# Generate common patterns: claude-{family}-{major}-{minor}
-for family, (ver_tuple, best_do) in family_best.items():
-    # Generate unversioned catchall: claude-{family} (not typically used, but safe)
-    # More importantly: generate versioned names Claude Code might request
-    # e.g., claude-sonnet-4-6, claude-haiku-4-6, claude-opus-4-6
-    # We check if they're already mapped; if not, add as fallback to best available.
-    for major in range(3, 6):
-        for minor in range(0, 10):
-            candidate = f"claude-{family}-{major}-{minor}"
-            if candidate not in mapped_cc_names:
-                entries.append((candidate, best_do))
-                mapped_cc_names.add(candidate)
-
-# Add date-suffixed entries for primary model names.
-# Claude Code requests models like "claude-haiku-4-5-20251001" (with date suffix)
-# but DO model IDs don't include dates. Add entries for all known Anthropic release
-# dates so dated model names route to the correct DO model.
-KNOWN_DATES = ["20240229", "20241022", "20250219", "20250514", "20250929", "20251001"]
-for base_name in list(primary_names):
-    # Find the DO model ID for this base name
-    do_id_for_base = None
-    for cc_name, do_id in entries:
-        if cc_name == base_name:
-            do_id_for_base = do_id
-            break
-    if do_id_for_base is None:
-        continue
-    for date in KNOWN_DATES:
-        dated = f"{base_name}-{date}"
-        if dated not in mapped_cc_names:
-            entries.append((dated, do_id_for_base))
-            mapped_cc_names.add(dated)
-KNOWN_SIZES = ["[1m]"]
-for base_name in list(primary_names):
-    # Find the DO model ID for this base name
-    do_id_for_base = None
-    for cc_name, do_id in entries:
-        if cc_name == base_name:
-            do_id_for_base = do_id
-            break
-    if do_id_for_base is None:
-        continue
-    for size in KNOWN_SIZES:
-        sized = f"{base_name}{size}"
-        if sized not in mapped_cc_names:
-            entries.append((sized, do_id_for_base))
-            mapped_cc_names.add(sized)
-
-# Write YAML
-lines = ["# Auto-generated by claudo — do not edit manually", "model_list:"]
-seen = set()
-for cc_name, do_id in entries:
-    if cc_name in seen:
-        continue
-    seen.add(cc_name)
-    lines.append(f"  - model_name: {cc_name}")
-    lines.append(f"    litellm_params:")
-    lines.append(f"      model: openai/{do_id}")
-    lines.append(f"      api_key: os.environ/DO_GRADIENT_API_KEY")
-    lines.append(f"      api_base: {API_BASE}")
-    lines.append(f"      drop_params: true")
-    lines.append(f"      request_timeout: 600")
-
-lines.append("")
-lines.append("general_settings:")
-lines.append("  drop_params: true")
-lines.append(f"  master_key: {MASTER_KEY}")
-lines.append("")
-lines.append("litellm_settings:")
-lines.append("  drop_params: true")
-lines.append("  request_timeout: 600")
-
-print("\n".join(lines))
-count = len(seen)
-print(f"Generated {count} model entries", file=sys.stderr)
+@@EMBED: src/python/config_gen.py@@
 PYEOF
 
   ok "Generated LiteLLM config from /v1/models"
@@ -889,28 +579,7 @@ cmd_models() {
 
   # Use Python to display model mappings (same logic as config generation)
   python3 - "${MODELS_CACHE}" <<'PYEOF' || die "Failed to parse models cache"
-"""
-Display a human-readable table of DO model → Claude Code model name mappings.
-
-Usage: python3 models.py <models_cache.json>
-"""
-import json, re, sys
-
-with open(sys.argv[1]) as f:
-    data = json.load(f)
-
-do_models = sorted(m["id"] for m in data.get("data", []) if "claude" in m["id"].lower())
-
-def primary_cc_name(do_id):
-    base = re.sub(r'^anthropic-', '', do_id)
-    return base.replace('.', '-')
-
-print()
-print(f"{'DO Gradient Model':<40}  →  {'Claude Code Model'}")
-print(f"{'─' * 40}     {'─' * 34}")
-for do_id in do_models:
-    cc = primary_cc_name(do_id)
-    print(f"{do_id:<40}  →  {cc}")
+@@EMBED: src/python/models.py@@
 PYEOF
 
   echo ""
