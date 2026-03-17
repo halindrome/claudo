@@ -641,14 +641,19 @@ Usage:
   claudo status             Show running proxy instances
   claudo stop-all           Kill all proxy instances
   claudo models             Show discovered model mappings
+  claudo profiles           List available profiles
   claudo version            Show version
   claudo help               Show this help
+
+Options:
+  --profile, -P NAME        Select named profile (default: "default")
 
 Examples:
   claudo setup              First-time setup
   claudo                    Interactive session
   claudo -p "explain this"  One-shot prompt
   claudo --model claude-sonnet-4-5-20250929 -p "hello"
+  claudo --profile work     Use the "work" profile (loads config.work.env)
 EOF
 }
 
