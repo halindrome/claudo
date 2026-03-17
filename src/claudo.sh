@@ -416,6 +416,8 @@ start_proxy() {
   local port="$1"
   local log_file="${LOGS_DIR}/proxy-${port}.log"
 
+  rotate_log_if_needed "${log_file}"
+
   local litellm_mode
   litellm_mode=$(resolve_litellm) || die "LiteLLM not found. Run: claudo setup"
 
