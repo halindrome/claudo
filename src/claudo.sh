@@ -637,6 +637,19 @@ EOF
 main() {
   ensure_dirs
 
+  # Early --profile scan (must precede load_config and subcommand dispatch)
+  local _i=1
+  while [[ $_i -le $# ]]; do
+    case "${!_i}" in
+      --profile|-P)
+        _i=$((_i + 1))
+        CLAUDO_PROFILE="${!_i}"
+        CONFIG_FILE="${CONFIG_DIR}/config.${CLAUDO_PROFILE}.env"
+        ;;
+    esac
+    _i=$((_i + 1))
+  done
+
   # Handle subcommands
   case "${1:-}" in
     setup)     cmd_setup; return ;;
@@ -688,6 +701,16 @@ main() {
   export ANTHROPIC_BASE_URL="http://127.0.0.1:${port}"
   export ANTHROPIC_AUTH_TOKEN="${PROXY_MASTER_KEY}"
   export DO_GRADIENT_API_KEY
+
+  # Strip --profile/-P and its value from args before passing to claude
+  local _args=()
+  local _skip=0
+  for _arg in "$@"; do
+    if [[ $_skip -eq 1 ]]; then _skip=0; continue; fi
+    if [[ "$_arg" == "--profile" || "$_arg" == "-P" ]]; then _skip=1; continue; fi
+    _args+=("$_arg")
+  done
+  set -- "${_args[@]+"${_args[@]}"}"
 
   # Model pinning: inject DEFAULT_MODEL if user didn't provide --model
   local _has_model=0
