@@ -200,8 +200,12 @@ load_config() {
 }
 
 save_config() {
-  printf '# claudo configuration — generated %s\nDO_GRADIENT_API_KEY=%q\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${DO_GRADIENT_API_KEY:-}" > "${CONFIG_FILE}"
+  {
+    echo "# claudo configuration — generated $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "DO_GRADIENT_API_KEY=${DO_GRADIENT_API_KEY:-}"
+    echo "DEFAULT_MODEL=${DEFAULT_MODEL:-}"
+    echo "LOG_ROTATION_SIZE_MB=${LOG_ROTATION_SIZE_MB:-10}"
+  } > "${CONFIG_FILE}"
   chmod 600 "${CONFIG_FILE}"
 }
 
