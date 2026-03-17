@@ -609,6 +609,26 @@ cmd_update() {
   ok "LiteLLM updated to v${version}"
 }
 
+cmd_profiles() {
+  ensure_dirs
+  local profile_file active_profiles=()
+  for profile_file in "${CONFIG_DIR}"/config.*.env; do
+    [[ -f "$profile_file" ]] || continue
+    local name
+    name="${profile_file##*/config.}"
+    name="${name%.env}"
+    if [[ "$name" == "$CLAUDO_PROFILE" ]]; then
+      echo "* ${name} (active)"
+    else
+      echo "  ${name}"
+    fi
+    active_profiles+=("$name")
+  done
+  if [[ ${#active_profiles[@]} -eq 0 ]]; then
+    info "No profiles found. Run 'claudo setup' to create one."
+  fi
+}
+
 cmd_help() {
   cat <<EOF
 claudo v${VERSION} — Claude Code via DigitalOcean Gradient AI
@@ -657,6 +677,7 @@ main() {
     status)    cmd_status; return ;;
     stop-all)  cmd_stop_all; return ;;
     models)    cmd_models; return ;;
+    profiles)  cmd_profiles; return ;;
     version)   cmd_version; return ;;
     help|--help|-h)  cmd_help; return ;;
   esac
