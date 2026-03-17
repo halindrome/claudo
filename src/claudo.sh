@@ -35,7 +35,7 @@
 #
 # WHAT HAPPENS ON EACH RUN
 # ────────────────────────
-#   1. Loads config (DO API key) from ~/.config/claudo/config.env
+#   1. Loads config (DO API key) from ~/.config/claudo/config.${CLAUDO_PROFILE}.env
 #   2. Discovers available Claude models from the DO /v1/models endpoint
 #      (cached for 24h in ~/.config/claudo/models_cache.json)
 #   3. Generates a LiteLLM config YAML that maps Claude Code model names
@@ -131,7 +131,8 @@ set -euo pipefail
 
 readonly VERSION="1.0.0"
 readonly CONFIG_DIR="${HOME}/.config/claudo"
-readonly CONFIG_FILE="${CONFIG_DIR}/config.env"
+CLAUDO_PROFILE="${CLAUDO_PROFILE:-default}"
+CONFIG_FILE="${CONFIG_DIR}/config.${CLAUDO_PROFILE}.env"
 readonly MODELS_CACHE="${CONFIG_DIR}/models_cache.json"
 readonly LITELLM_CONFIG="${CONFIG_DIR}/litellm_config.yaml"
 readonly VENV_DIR="${CONFIG_DIR}/venv"
@@ -193,6 +194,10 @@ resolve_litellm() {
 # ── Config ───────────────────────────────────────────────────────────────────
 
 load_config() {
+  # Migrate legacy config.env to config.default.env on first profile-aware run
+  if [[ ! -f "${CONFIG_FILE}" ]] && [[ -f "${CONFIG_DIR}/config.env" ]]; then
+    cp "${CONFIG_DIR}/config.env" "${CONFIG_FILE}"
+  fi
   if [[ -f "${CONFIG_FILE}" ]]; then
     # shellcheck disable=SC1090
     source "${CONFIG_FILE}"
