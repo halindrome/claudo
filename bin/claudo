@@ -3,6 +3,9 @@
 # ║  claudo — Claude Code via DigitalOcean Gradient AI                         ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 #
+# GENERATED FILE — do not edit directly.
+# Edit src/claudo.sh and src/python/*.py, then run 'make build' to regenerate.
+#
 # WHAT THIS SCRIPT DOES
 # ─────────────────────
 # claudo lets you run Claude Code (Anthropic's CLI tool) against DigitalOcean's
@@ -84,6 +87,7 @@
 #   ├── models_cache.json       Cached /v1/models response (24h TTL)
 #   ├── litellm_config.yaml     Auto-generated LiteLLM proxy config
 #   ├── litellm_wrapper.py      Python wrapper with monkey-patches
+#   ├── auth.py                 Claude Code auth bootstrap helper
 #   ├── venv/                   Python venv with LiteLLM installed
 #   ├── instances/
 #   │   └── proxy-{port}.pid    PID files for running proxy instances
@@ -132,6 +136,7 @@ readonly MODELS_CACHE="${CONFIG_DIR}/models_cache.json"
 readonly LITELLM_CONFIG="${CONFIG_DIR}/litellm_config.yaml"
 readonly VENV_DIR="${CONFIG_DIR}/venv"
 readonly LITELLM_WRAPPER="${CONFIG_DIR}/litellm_wrapper.py"
+readonly AUTH_SCRIPT="${CONFIG_DIR}/auth.py"
 readonly INSTANCES_DIR="${CONFIG_DIR}/instances"
 readonly LOGS_DIR="${CONFIG_DIR}/logs"
 readonly PORT_MIN=4100
@@ -161,13 +166,30 @@ write_litellm_wrapper() {
   cat > "${LITELLM_WRAPPER}" <<'PYEOF'
 """claudo litellm wrapper — patches for DO Gradient AI compatibility."""
 import sys
+import litellm
+
+# Route /v1/messages through chat/completions instead of the OpenAI Responses API.
+# DO Gradient AI exposes an OpenAI-compatible endpoint (openai/ model prefix) but does
+# NOT implement the Responses API. Without this flag, LiteLLM detects openai/ prefix
+# and tries to call litellm.aresponses(), which DO returns 404 on.
+litellm.use_chat_completions_url_for_anthropic_messages = True
+assert getattr(litellm, 'use_chat_completions_url_for_anthropic_messages', None) is True, \
+    "[claudo] FATAL: litellm.use_chat_completions_url_for_anthropic_messages flag missing — " \
+    "LiteLLM API changed. Update wrapper.py."
 
 # Patch uvicorn to use asyncio instead of uvloop (uvloop broken on Python 3.14+)
 try:
     import uvicorn.config
-    uvicorn.config.LOOP_SETUPS["uvloop"] = "uvicorn.loops.asyncio:asyncio_setup"
-except Exception:
-    pass
+    if not hasattr(uvicorn.config, 'LOOP_SETUPS'):
+        print("[claudo] WARNING: uvicorn.config.LOOP_SETUPS not found — "
+              "uvloop patch skipped. Proxy may fail on Python 3.14+ if uvloop is installed.",
+              file=sys.stderr)
+    else:
+        uvicorn.config.LOOP_SETUPS["uvloop"] = "uvicorn.loops.asyncio:asyncio_setup"
+except ImportError:
+    pass  # uvicorn not installed yet — LiteLLM will install it; patch applied at proxy start
+except Exception as e:
+    print(f"[claudo] WARNING: uvloop patch failed: {e}", file=sys.stderr)
 
 # Patch the Anthropic pass-through adapter to exclude params that DO/Anthropic
 # rejects when forwarded via OpenAI format (e.g. context_management in interactive mode).
@@ -177,78 +199,131 @@ try:
         LiteLLMMessagesToCompletionTransformationHandler as _Handler,
     )
 
-    _orig_prepare = _Handler._prepare_completion_kwargs
+    if not hasattr(_Handler, '_prepare_completion_kwargs'):
+        print(
+            "[claudo] WARNING: LiteLLMMessagesToCompletionTransformationHandler"
+            "._prepare_completion_kwargs not found — adapter patch skipped. "
+            "context_management and empty text blocks will NOT be stripped. "
+            "Update wrapper.py to match current LiteLLM internals.",
+            file=sys.stderr,
+        )
+    else:
+        _orig_prepare = _Handler._prepare_completion_kwargs
 
-    def _strip_empty_text_blocks(messages):
-        if not isinstance(messages, list):
-            return messages
-        cleaned = []
-        for msg in messages:
-            if not isinstance(msg, dict):
+        def _strip_empty_text_blocks(messages):
+            if not isinstance(messages, list):
+                return messages
+            cleaned = []
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    cleaned.append(msg)
+                    continue
+                content = msg.get("content")
+                if isinstance(content, list):
+                    new_content = []
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text")
+                            if text is None or (isinstance(text, str) and text.strip() == ""):
+                                continue
+                        new_content.append(block)
+                    if len(new_content) == 0:
+                        # Drop messages that are effectively empty after filtering
+                        continue
+                    msg = dict(msg)
+                    msg["content"] = new_content
+                elif isinstance(content, str) and content.strip() == "":
+                    # Drop empty string-only messages
+                    continue
                 cleaned.append(msg)
-                continue
-            content = msg.get("content")
-            if isinstance(content, list):
-                new_content = []
-                for block in content:
+            return cleaned
+
+        # All params are keyword-only (after *), so **kwargs captures them correctly
+        def _patched_prepare(**kwargs):
+            extra_kwargs = kwargs.get("extra_kwargs") or {}
+            for drop_key in ("context_management",):
+                extra_kwargs.pop(drop_key, None)
+            kwargs["extra_kwargs"] = extra_kwargs
+            # Remove empty text blocks which Anthropic rejects
+            if "messages" in kwargs:
+                kwargs["messages"] = _strip_empty_text_blocks(kwargs.get("messages"))
+            system = kwargs.get("system")
+            if isinstance(system, list):
+                new_system = []
+                for block in system:
                     if isinstance(block, dict) and block.get("type") == "text":
                         text = block.get("text")
                         if text is None or (isinstance(text, str) and text.strip() == ""):
                             continue
-                    new_content.append(block)
-                if len(new_content) == 0:
-                    # Drop messages that are effectively empty after filtering
-                    continue
-                msg = dict(msg)
-                msg["content"] = new_content
-            elif isinstance(content, str) and content.strip() == "":
-                # Drop empty string-only messages
-                continue
-            cleaned.append(msg)
-        return cleaned
+                    new_system.append(block)
+                kwargs["system"] = new_system if new_system else None
+            elif isinstance(system, str) and system.strip() == "":
+                kwargs["system"] = None
+            return _orig_prepare(**kwargs)
 
-    # All params are keyword-only (after *), so **kwargs captures them correctly
-    def _patched_prepare(**kwargs):
-        extra_kwargs = kwargs.get("extra_kwargs") or {}
-        for drop_key in ("context_management",):
-            extra_kwargs.pop(drop_key, None)
-        kwargs["extra_kwargs"] = extra_kwargs
-        # Remove empty text blocks which Anthropic rejects
-        if "messages" in kwargs:
-            kwargs["messages"] = _strip_empty_text_blocks(kwargs.get("messages"))
-        system = kwargs.get("system")
-        if isinstance(system, list):
-            new_system = []
-            for block in system:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text = block.get("text")
-                    if text is None or (isinstance(text, str) and text.strip() == ""):
-                        continue
-                new_system.append(block)
-            kwargs["system"] = new_system if new_system else None
-        elif isinstance(system, str) and system.strip() == "":
-            kwargs["system"] = None
-        return _orig_prepare(**kwargs)
-
-    _Handler._prepare_completion_kwargs = staticmethod(_patched_prepare)
-
-    # Prevent routing to OpenAI Responses API for DO models.
-    # LiteLLM detects openai/ prefix + thinking params and prefixes model with
-    # "responses/" to use OpenAI's Responses API. DO doesn't support this.
-    _orig_route = _Handler._route_openai_thinking_to_responses_api_if_needed
-
-    def _patched_route(completion_kwargs, *, thinking=None):
-        model = completion_kwargs.get("model", "")
-        if isinstance(model, str) and "anthropic" in model:
-            return  # skip responses API routing for DO Anthropic models
-        return _orig_route(completion_kwargs, thinking=thinking)
-
-    _Handler._route_openai_thinking_to_responses_api_if_needed = staticmethod(_patched_route)
+        _Handler._prepare_completion_kwargs = staticmethod(_patched_prepare)
+except ImportError as e:
+    print(
+        f"[claudo] WARNING: failed to import LiteLLM adapter handler: {e}\n"
+        "  The experimental_pass_through adapter path has moved or been removed.\n"
+        "  context_management params will NOT be stripped — Claude Code may get API errors.\n"
+        "  Update the import path in src/python/wrapper.py.",
+        file=sys.stderr,
+    )
 except Exception as e:
     print(f"[claudo] WARNING: failed to patch adapter: {e}", file=sys.stderr)
 
 from litellm.proxy.proxy_cli import run_server
 run_server()
+PYEOF
+}
+
+# Write the auth bootstrap helper script
+write_auth_script() {
+  cat > "${AUTH_SCRIPT}" <<'PYEOF'
+"""
+Bootstrap and check Claude Code auth configuration.
+
+Usage:
+  python3 auth.py check  <path>   — print 'yes' if already configured, 'no' otherwise
+  python3 auth.py update <path>   — update existing .claude.json to mark as configured
+  python3 auth.py create <path>   — create minimal .claude.json for API key auth
+"""
+import json, sys
+from datetime import datetime, timezone
+
+cmd = sys.argv[1]
+path = sys.argv[2]
+
+if cmd == "check":
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        print("yes" if d.get("numStartups", 0) >= 1 else "no")
+    except Exception:
+        print("no")
+
+elif cmd == "update":
+    with open(path) as f:
+        d = json.load(f)
+    d["numStartups"] = max(d.get("numStartups", 0), 1)
+    if "firstStartTime" not in d:
+        d["firstStartTime"] = datetime.now(timezone.utc).isoformat()
+    with open(path, "w") as f:
+        json.dump(d, f, indent=2)
+
+elif cmd == "create":
+    d = {
+        "numStartups": 1,
+        "firstStartTime": datetime.now(timezone.utc).isoformat(),
+        "hasCompletedOnboarding": True,
+    }
+    with open(path, "w") as f:
+        json.dump(d, f, indent=2)
+
+else:
+    print(f"Unknown command: {cmd}", file=sys.stderr)
+    sys.exit(1)
 PYEOF
 }
 
@@ -307,6 +382,7 @@ check_deps() {
     python3 -m venv "${VENV_DIR}" || die "Failed to create virtual environment"
     "${VENV_DIR}/bin/pip" install --quiet 'litellm[proxy]' || die "Failed to install LiteLLM"
     write_litellm_wrapper
+    write_auth_script
     ok "LiteLLM installed in ${VENV_DIR}"
   fi
 
@@ -323,14 +399,8 @@ bootstrap_claude_auth() {
 
   # Check if Claude Code auth is already configured
   if [[ -f "${claude_json}" ]]; then
-    # Check if already has valid auth or sufficient setup
     local has_setup
-    has_setup=$(python3 -c "
-import json, sys
-with open(sys.argv[1]) as f:
-    d = json.load(f)
-print('yes' if d.get('numStartups', 0) >= 1 else 'no')
-" "${claude_json}" 2>/dev/null || echo "no")
+    has_setup=$(python3 "${AUTH_SCRIPT}" check "${claude_json}" 2>/dev/null || echo "no")
     if [[ "${has_setup}" == "yes" ]]; then
       return 0
     fi
@@ -340,32 +410,9 @@ print('yes' if d.get('numStartups', 0) >= 1 else 'no')
   mkdir -p "${claude_dir}"
 
   if [[ -f "${claude_json}" ]]; then
-    # Update existing config
-    python3 -c "
-import json, sys
-path = sys.argv[1]
-with open(path) as f:
-    d = json.load(f)
-d['numStartups'] = max(d.get('numStartups', 0), 1)
-if 'firstStartTime' not in d:
-    from datetime import datetime, timezone
-    d['firstStartTime'] = datetime.now(timezone.utc).isoformat()
-with open(path, 'w') as f:
-    json.dump(d, f, indent=2)
-" "${claude_json}" 2>/dev/null || warn "Could not update Claude Code config"
+    python3 "${AUTH_SCRIPT}" update "${claude_json}" 2>/dev/null || warn "Could not update Claude Code config"
   else
-    # Create minimal config
-    python3 -c "
-import json, sys
-from datetime import datetime, timezone
-d = {
-    'numStartups': 1,
-    'firstStartTime': datetime.now(timezone.utc).isoformat(),
-    'hasCompletedOnboarding': True
-}
-with open(sys.argv[1], 'w') as f:
-    json.dump(d, f, indent=2)
-" "${claude_json}" 2>/dev/null || warn "Could not create Claude Code config"
+    python3 "${AUTH_SCRIPT}" create "${claude_json}" 2>/dev/null || warn "Could not create Claude Code config"
     chmod 600 "${claude_json}"
   fi
 
@@ -463,6 +510,14 @@ generate_litellm_config() {
   # This avoids any hardcoded mapping table — model names are derived algorithmically,
   # and fallback aliases are generated for models Claude Code may request but DO lacks.
   python3 - "${MODELS_CACHE}" "${DO_API_BASE}/v1" "${PROXY_MASTER_KEY}" <<'PYEOF' > "${LITELLM_CONFIG}" || die "Failed to generate LiteLLM config"
+"""
+Generate a LiteLLM proxy config YAML from a DO /v1/models response cache.
+
+Usage: python3 config_gen.py <models_cache.json> <api_base> <master_key>
+
+Reads the cached model list, generates all plausible Claude Code model name
+aliases for each DO model, and writes a LiteLLM model_list YAML to stdout.
+"""
 import json, re, sys
 
 API_BASE = sys.argv[2]
@@ -571,6 +626,21 @@ for base_name in list(primary_names):
         if dated not in mapped_cc_names:
             entries.append((dated, do_id_for_base))
             mapped_cc_names.add(dated)
+KNOWN_SIZES = ["[1m]"]
+for base_name in list(primary_names):
+    # Find the DO model ID for this base name
+    do_id_for_base = None
+    for cc_name, do_id in entries:
+        if cc_name == base_name:
+            do_id_for_base = do_id
+            break
+    if do_id_for_base is None:
+        continue
+    for size in KNOWN_SIZES:
+        sized = f"{base_name}{size}"
+        if sized not in mapped_cc_names:
+            entries.append((sized, do_id_for_base))
+            mapped_cc_names.add(sized)
 
 # Write YAML
 lines = ["# Auto-generated by claudo — do not edit manually", "model_list:"]
@@ -790,6 +860,11 @@ cmd_models() {
 
   # Use Python to display model mappings (same logic as config generation)
   python3 - "${MODELS_CACHE}" <<'PYEOF' || die "Failed to parse models cache"
+"""
+Display a human-readable table of DO model → Claude Code model name mappings.
+
+Usage: python3 models.py <models_cache.json>
+"""
 import json, re, sys
 
 with open(sys.argv[1]) as f:
@@ -881,9 +956,10 @@ main() {
   # Regenerate LiteLLM config each session (embeds per-session master key)
   generate_litellm_config
 
-  # Always regenerate wrapper to ensure patches are up-to-date
+  # Always regenerate wrapper and auth script to ensure patches are up-to-date
   if [[ -x "${VENV_DIR}/bin/python" ]]; then
     write_litellm_wrapper
+    write_auth_script
   fi
 
   # Find an available port
