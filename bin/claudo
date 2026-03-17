@@ -352,8 +352,12 @@ load_config() {
 }
 
 save_config() {
-  printf '# claudo configuration — generated %s\nDO_GRADIENT_API_KEY=%q\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${DO_GRADIENT_API_KEY:-}" > "${CONFIG_FILE}"
+  {
+    echo "# claudo configuration — generated $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "DO_GRADIENT_API_KEY=${DO_GRADIENT_API_KEY:-}"
+    echo "DEFAULT_MODEL=${DEFAULT_MODEL:-}"
+    echo "LOG_ROTATION_SIZE_MB=${LOG_ROTATION_SIZE_MB:-10}"
+  } > "${CONFIG_FILE}"
   chmod 600 "${CONFIG_FILE}"
 }
 
@@ -700,11 +704,29 @@ find_available_port() {
   die "No available ports in range ${PORT_MIN}-${PORT_MAX}. Run: claudo stop-all"
 }
 
+rotate_log_if_needed() {
+  local log_file="$1"
+  local max_kb=$(( ${LOG_ROTATION_SIZE_MB:-10} * 1024 ))
+  [[ -f "$log_file" ]] || return 0
+  # Cross-platform size check using find (avoids stat BSD/GNU mismatch)
+  if [[ -z "$(find "$log_file" -size +"${max_kb}k" 2>/dev/null)" ]]; then
+    return 0
+  fi
+  # Rotate: shift existing backups .4.gz→.5.gz ... .1.gz→.2.gz
+  local i
+  for i in 4 3 2 1; do
+    [[ -f "${log_file}.${i}.gz" ]] && mv "${log_file}.${i}.gz" "${log_file}.$((i+1)).gz"
+  done
+  gzip -9 < "$log_file" > "${log_file}.1.gz" && : > "$log_file"
+}
+
 # ── Proxy Lifecycle ──────────────────────────────────────────────────────────
 
 start_proxy() {
   local port="$1"
   local log_file="${LOGS_DIR}/proxy-${port}.log"
+
+  rotate_log_if_needed "${log_file}"
 
   local litellm_mode
   litellm_mode=$(resolve_litellm) || die "LiteLLM not found. Run: claudo setup"
@@ -992,6 +1014,15 @@ main() {
   export ANTHROPIC_BASE_URL="http://127.0.0.1:${port}"
   export ANTHROPIC_AUTH_TOKEN="${PROXY_MASTER_KEY}"
   export DO_GRADIENT_API_KEY
+
+  # Model pinning: inject DEFAULT_MODEL if user didn't provide --model
+  local _has_model=0
+  for _arg in "$@"; do
+    [[ "$_arg" == "--model" ]] && { _has_model=1; break; }
+  done
+  if [[ ${_has_model} -eq 0 ]] && [[ -n "${DEFAULT_MODEL:-}" ]]; then
+    set -- --model "${DEFAULT_MODEL}" "$@"
+  fi
 
   # Pass all arguments through to claude, or run interactively
   claude "$@"
