@@ -679,6 +679,14 @@ main() {
         CLAUDO_PROFILE="${!_i}"
         CONFIG_FILE="${CONFIG_DIR}/config.${CLAUDO_PROFILE}.env"
         ;;
+      --profile=*|-P=*)
+        local _pval="${!_i#*=}"
+        if [[ -z "${_pval}" ]]; then
+          die "Profile name cannot be empty"
+        fi
+        CLAUDO_PROFILE="${_pval}"
+        CONFIG_FILE="${CONFIG_DIR}/config.${CLAUDO_PROFILE}.env"
+        ;;
     esac
     _i=$((_i + 1))
   done
@@ -742,14 +750,16 @@ main() {
   for _arg in "$@"; do
     if [[ $_skip -eq 1 ]]; then _skip=0; continue; fi
     if [[ "$_arg" == "--profile" || "$_arg" == "-P" ]]; then _skip=1; continue; fi
+    if [[ "$_arg" == --profile=* || "$_arg" == -P=* ]]; then continue; fi
     _args+=("$_arg")
   done
   set -- "${_args[@]+"${_args[@]}"}"
 
   # Model pinning: inject DEFAULT_MODEL if user didn't provide --model
+  # Handles both "--model value" and "--model=value" forms
   local _has_model=0
   for _arg in "$@"; do
-    [[ "$_arg" == "--model" ]] && { _has_model=1; break; }
+    [[ "$_arg" == "--model" || "$_arg" == --model=* ]] && { _has_model=1; break; }
   done
   if [[ ${_has_model} -eq 0 ]] && [[ -n "${DEFAULT_MODEL:-}" ]]; then
     set -- --model "${DEFAULT_MODEL}" "$@"
