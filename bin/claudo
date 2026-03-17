@@ -722,7 +722,12 @@ rotate_log_if_needed() {
   for i in 4 3 2 1; do
     [[ -f "${log_file}.${i}.gz" ]] && mv "${log_file}.${i}.gz" "${log_file}.$((i+1)).gz"
   done
-  gzip -9 < "$log_file" > "${log_file}.1.gz" && : > "$log_file"
+  if gzip -9 < "$log_file" > "${log_file}.1.gz" 2>/dev/null; then
+    : > "$log_file"
+  else
+    warn "Log rotation skipped: gzip failed (is gzip installed?)"
+    rm -f "${log_file}.1.gz" 2>/dev/null || true
+  fi
 }
 
 # ── Proxy Lifecycle ──────────────────────────────────────────────────────────
@@ -911,11 +916,8 @@ PYEOF
   echo ""
   local cache_time="unknown"
   if [[ -f "${MODELS_CACHE}" ]]; then
-    if [[ "$(uname)" == "Darwin" ]]; then
-      cache_time=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M" "${MODELS_CACHE}" 2>/dev/null || echo "unknown")
-    else
-      cache_time=$(stat -c "%y" "${MODELS_CACHE}" 2>/dev/null | cut -d. -f1 || echo "unknown")
-    fi
+    # date -r works on both macOS (BSD date) and Linux (GNU coreutils 8.1+)
+    cache_time=$(date -r "${MODELS_CACHE}" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "unknown")
   fi
   info "Cache last updated: ${cache_time}"
   info "Run 'claudo setup' to refresh"
@@ -999,6 +1001,12 @@ main() {
     case "${!_i}" in
       --profile|-P)
         _i=$((_i + 1))
+        if [[ $_i -gt $# ]]; then
+          die "--profile requires a name argument"
+        fi
+        if [[ -z "${!_i}" ]]; then
+          die "Profile name cannot be empty"
+        fi
         CLAUDO_PROFILE="${!_i}"
         CONFIG_FILE="${CONFIG_DIR}/config.${CLAUDO_PROFILE}.env"
         ;;

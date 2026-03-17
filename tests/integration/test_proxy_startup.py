@@ -99,8 +99,8 @@ def test_litellm_wrapper_contains_patches():
     )
 
 
-def test_stat_cache_ttl_platform_compatibility(tmp_path):
-    """os.path.getmtime works cross-platform to read cache file mtime within 60s."""
+def test_cache_file_mtime_readable(tmp_path):
+    """os.path.getmtime returns a recent timestamp for a freshly created cache file."""
     cache_file = tmp_path / "models_cache.json"
     cache_file.write_text(json.dumps({"data": []}))
 
