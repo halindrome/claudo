@@ -1,0 +1,16 @@
+[
+  {
+    "messages": [
+      {"role": "user", "content": "hello"},
+      {"role": "assistant", "content": [{"type": "text", "text": "Hi there"}]}
+    ],
+    "extra_kwargs": {}
+  },
+  {
+    "messages": [
+      {"role": "user", "content": ""},
+      {"role": "assistant", "content": [{"type": "text", "text": ""}]}
+    ],
+    "extra_kwargs": {"context_management": {"type": "auto"}}
+  }
+]
