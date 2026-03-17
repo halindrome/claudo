@@ -1,6 +1,6 @@
 {
   "name": "claudo",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Run Claude Code against DigitalOcean Gradient AI — spins up a local LiteLLM proxy to bridge Claude Code's Anthropic API format to DO's OpenAI-compatible endpoint.",
   "license": "MIT",
   "bin": {

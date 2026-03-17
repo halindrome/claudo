@@ -129,7 +129,7 @@
 
 set -euo pipefail
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 readonly CONFIG_DIR="${HOME}/.config/claudo"
 CLAUDO_PROFILE="${CLAUDO_PROFILE:-default}"
 CONFIG_FILE="${CONFIG_DIR}/config.${CLAUDO_PROFILE}.env"
