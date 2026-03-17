@@ -429,19 +429,22 @@ wait_for_proxy() {
   info "Waiting for LiteLLM proxy on port ${port}..."
   while [[ ${elapsed} -lt ${HEALTH_TIMEOUT} ]]; do
     if curl -sf "${url}" >/dev/null 2>&1; then
+      [[ -t 1 ]] && printf '\n'
       ok "Proxy ready on port ${port}"
       return 0
     fi
     # Check proxy hasn't died
     if [[ -n "${_PROXY_PID}" ]] && ! kill -0 "${_PROXY_PID}" 2>/dev/null; then
-      echo ""
+      [[ -t 1 ]] && printf '\n'
       warn "Proxy exited unexpectedly. Log output:"
       tail -20 "${LOGS_DIR}/proxy-${port}.log" 2>/dev/null || true
       die "LiteLLM proxy failed to start"
     fi
     sleep 1
+    [[ -t 1 ]] && printf '.'
     elapsed=$((elapsed + 1))
   done
+  [[ -t 1 ]] && printf '\n'
   die "Proxy health check timed out after ${HEALTH_TIMEOUT}s"
 }
 
@@ -564,6 +567,21 @@ cmd_version() {
   echo "claudo v${VERSION}"
 }
 
+cmd_update() {
+  if [[ ! -d "${VENV_DIR}" ]]; then
+    die "No venv found. Run 'claudo setup' first."
+  fi
+  info "Upgrading LiteLLM..."
+  local pip="${VENV_DIR}/bin/pip"
+  # pip install --upgrade installs the latest version into the existing venv
+  "${pip}" install --upgrade --quiet 'litellm[proxy]' || die "Upgrade failed"
+  local version
+  version=$("${VENV_DIR}/bin/python" -c "import litellm; print(litellm.__version__)" 2>/dev/null || echo "unknown")
+  write_litellm_wrapper
+  write_auth_script
+  ok "LiteLLM updated to v${version}"
+}
+
 cmd_help() {
   cat <<EOF
 claudo v${VERSION} — Claude Code via DigitalOcean Gradient AI
@@ -572,6 +590,7 @@ Usage:
   claudo                    Start interactive Claude session via DO
   claudo <claude args>      Pass arguments to claude (e.g. claudo -p "hello")
   claudo setup              Configure API key and discover models
+  claudo update             Upgrade LiteLLM to latest version (run 'claudo stop-all' first)
   claudo status             Show running proxy instances
   claudo stop-all           Kill all proxy instances
   claudo models             Show discovered model mappings
@@ -594,6 +613,7 @@ main() {
   # Handle subcommands
   case "${1:-}" in
     setup)     cmd_setup; return ;;
+    update)    cmd_update; return ;;
     status)    cmd_status; return ;;
     stop-all)  cmd_stop_all; return ;;
     models)    cmd_models; return ;;
