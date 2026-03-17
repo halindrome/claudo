@@ -1,0 +1,39 @@
+# codebase-memory-mcp allowed tools
+# Add these 14 tools to your .claude/settings.local.json under "permissions.allow"
+#
+# Example JSON structure:
+# {
+#   "permissions": {
+#     "allow": [
+#       "mcp__codebase-memory-mcp__index_repository",
+#       "mcp__codebase-memory-mcp__index_status",
+#       ... (add all 14 below)
+#     ]
+#   }
+# }
+
+mcp__codebase-memory-mcp__index_repository
+mcp__codebase-memory-mcp__index_status
+mcp__codebase-memory-mcp__list_projects
+mcp__codebase-memory-mcp__delete_project
+mcp__codebase-memory-mcp__get_architecture
+mcp__codebase-memory-mcp__get_graph_schema
+mcp__codebase-memory-mcp__search_graph
+mcp__codebase-memory-mcp__search_code
+mcp__codebase-memory-mcp__query_graph
+mcp__codebase-memory-mcp__get_code_snippet
+mcp__codebase-memory-mcp__trace_call_path
+mcp__codebase-memory-mcp__detect_changes
+mcp__codebase-memory-mcp__manage_adr
+mcp__codebase-memory-mcp__ingest_traces
+
+# Context Mode MCP tools (optional add-on)
+mcp__context-mode__ctx_execute
+mcp__context-mode__ctx_batch_execute
+mcp__context-mode__ctx_execute_file
+mcp__context-mode__ctx_index
+mcp__context-mode__ctx_search
+mcp__context-mode__ctx_fetch_and_index
+mcp__context-mode__ctx_stats
+mcp__context-mode__ctx_doctor
+mcp__context-mode__ctx_upgrade

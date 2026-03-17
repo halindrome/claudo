@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# VBW planning artifacts (tooling state, not source)
+.vbw-planning/
+
+# Claude Code local state
+.claude/agent-memory
+.claude/agent-memory-local
+.claude/context-mode.db
+.claude/settings.json.backup
+.claude/settings.local.json
+.claude/worktrees/
+
+# LiteLLM proxy venv (created at runtime by claudo)
+litellm-venv/
+
+# Logs
+*.log
+
+# macOS
+.DS_Store
